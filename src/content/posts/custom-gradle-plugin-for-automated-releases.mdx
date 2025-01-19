@@ -1,0 +1,329 @@
+---
+title: 'Building a Custom Gradle Plugin for Automated Library Releases'
+date: '2024-01-19'
+description: 'How I simplified library publishing and release management using a custom Gradle plugin with conventional commits and semantic versioning'
+tags: ['gradle', 'kotlin', 'android', 'automation', 'ci-cd', 'git-hooks']
+---
+
+# Building a Custom Gradle Plugin for Automated Library Releases
+
+Managing releases for multiple library modules in a single project can be challenging, especially when dealing with different module types like Android libraries and Kotlin Multiplatform modules. In this post, I'll share how I created a custom Gradle plugin to automate and simplify this process.
+
+## The Problem
+
+In our project, we had several challenges:
+
+1. Multiple library modules with different configurations:
+   - Multiple Android library module
+   - Multiple Kotlin Multiplatform library modules
+2. Repetitive publishing configuration in each `build.gradle` file
+3. Inconsistent commit messages making it hard to track changes
+4. Manual version management for each module
+5. Complex CI/CD pipeline configuration
+
+## The Solution: A Custom Gradle Plugin
+
+I developed a Gradle plugin that addresses these challenges through automation and convention over configuration.
+
+### Key Features
+
+1. **Unified Publishing Configuration**
+```kotlin
+// Before: In each module's build.gradle
+publishing {
+    publications {
+        // Complex publishing configuration
+    }
+}
+
+// After: Simply apply the plugin
+plugins {
+    id("com.example.library-publisher")
+}
+```
+
+2. **Automated Git Hooks Setup**
+The plugin automatically configures git hooks for:
+- Pre-commit linting
+- Commit message validation
+- Conventional commits enforcement
+
+```bash
+# Example of enforced commit message format
+feat(android-lib): add new UI components
+fix(kmm-lib): resolve iOS compatibility issue
+chore(build): update dependency versions
+```
+
+3. **Smart Version Management**
+The plugin integrates with Node.js utilities to:
+- Analyze commit history
+- Determine which modules changed
+- Calculate next semantic version
+
+```typescript
+// Internal version calculation logic
+function determineNextVersion(commits, currentVersion) {
+    if (hasBreakingChange(commits)) return bumpMajor(currentVersion);
+    if (hasNewFeature(commits)) return bumpMinor(currentVersion);
+    return bumpPatch(currentVersion);
+}
+```
+
+4. **Simplified CI Configuration**
+Before:
+```yaml
+# Complex .gitlab-ci.yml with multiple jobs
+publish-android-lib:
+  script: ./gradlew :android-lib:publish
+publish-kmm-lib-1:
+  script: ./gradlew :kmm-lib-1:publish
+publish-kmm-lib-2:
+  script: ./gradlew :kmm-lib-2:publish
+```
+
+After:
+```yaml
+# Simplified .gitlab-ci.yml
+release:
+  script: ./gradlew release
+```
+
+## Technical Implementation
+
+### Plugin Structure
+
+The plugin is structured around several key components:
+
+```kotlin
+class AggregateReleasePlugin : Plugin<Project> {
+    override fun apply(target: Project) {
+        // 1. Setup environment tasks
+        target.tasks.register("setupYarn", SetupYarnEnvironmentTask::class.java)
+        target.tasks.register("cleanYarn", CleanupYarnEnvironmentTask::class.java)
+        
+        // 2. Install git hooks
+        target.tasks.register("installScripts", PreCommitHooksInstallationTask::class.java) {
+            dependsOn("setupYarn")
+            finalizedBy("cleanYarn")
+        }
+
+        // 3. Configure subprojects
+        target.subprojects.forEach { subproject ->
+            configureSubproject(subproject)
+        }
+
+        // 4. Setup release tasks after all projects are evaluated
+        target.gradle.projectsEvaluated {
+            setupReleaseTasks(target)
+        }
+    }
+}
+```
+
+### Publishing Configuration
+
+The plugin uses extensions to configure publishing for each module:
+
+```kotlin
+abstract class IxigoPublicationExtension(private val project: Project) {
+    abstract val artifactId: Property<String>
+    abstract val groupId: Property<String>
+    abstract val version: Property<String>
+    internal var publishingEnabled: Boolean = false
+
+    fun enablePublishing() {
+        publishingEnabled = true
+    }
+}
+
+// Usage in build.gradle.kts
+ixigoPublishing {
+    artifactId.set("my-library")
+    groupId.set("com.example")
+    version.set("1.0.0")
+    enablePublishing()
+}
+```
+
+### Smart Change Detection
+
+The plugin automatically detects which modules have changed and need to be published:
+
+```kotlin
+open class DetectSourceChangesTask : DefaultTask() {
+    @TaskAction
+    fun detectChanges() {
+        project.subprojects.forEach { subproject ->
+            val projectDir = subproject.projectDir
+            // Check git diff for changes
+            val command = arrayOf(
+                "git", "diff", "--name-only", 
+                "HEAD~1", "--", projectDir.toString()
+            )
+            
+            project.exec {
+                commandLine = command.toList()
+                standardOutput = output
+            }
+
+            if (hasChanges && isPublishableModule) {
+                changedSubprojects.add(subproject.name)
+            }
+        }
+    }
+}
+```
+
+### Dependency-Aware Publishing
+
+The plugin uses topological sorting to ensure modules are published in the correct order:
+
+```kotlin
+open class TopologicalSortTask : DefaultTask() {
+    @TaskAction
+    fun sortSubprojects() {
+        val changedSubprojects = getChangedProjects()
+        val dependencyGraph = buildDependencyGraph(changedSubprojects)
+        val sortedProjects = topologicalSort(dependencyGraph)
+        
+        // Store sorted projects for publishing
+        outputFile.writeText(sortedProjects.joinToString("\n"))
+    }
+
+    private fun topologicalSort(graph: Map<String, List<String>>): List<String> {
+        val inDegree = calculateInDegrees(graph)
+        val queue = LinkedList<String>()
+        val result = mutableListOf<String>()
+        
+        // Add nodes with no dependencies
+        graph.keys.filter { inDegree[it] == 0 }.forEach { queue.add(it) }
+        
+        while (queue.isNotEmpty()) {
+            val project = queue.poll()
+            result.add(project)
+            
+            // Update dependencies
+            graph[project]?.forEach { dependent ->
+                inDegree[dependent] = inDegree[dependent]!! - 1
+                if (inDegree[dependent] == 0) queue.add(dependent)
+            }
+        }
+        
+        return result
+    }
+}
+```
+
+### Automated Version Management
+
+The plugin integrates with standard-version for semantic versioning:
+
+```kotlin
+open class StandardVersionNpmTask : DefaultTask() {
+    @TaskAction
+    fun runStandardVersion() {
+        val yarn = project.executeCommandAndCaptureOutput("which yarn")
+        project.executeCommand(
+            "$yarn run release --verbose --infile ../CHANGELOG.md -t ${name}- --no-verify",
+            environmentVariables = mapOf(
+                "SCOPE" to project.getProjectCommitScope(),
+                "PROJECT_NAME" to project.name
+            )
+        )
+    }
+}
+```
+
+### Release Task Orchestration
+
+The plugin coordinates all tasks in the correct order:
+
+```kotlin
+abstract class BaseAggregatePublishTask : DefaultTask() {
+    init {
+        project.subprojects
+            .filter { it.isPublishingEnabled() }
+            .forEach { subproject ->
+                // Configure version update
+                val standardReleaseTask = subproject.tasks
+                    .named("standardVersionRelease")
+                    .configure { onlyIf { shouldRunForSubproject(subproject) } }
+                
+                // Configure publish
+                val publishTask = configurePublishSubproject(subproject)
+                publishTask?.let {
+                    it.mustRunAfter(standardReleaseTask)
+                    this.dependsOn(it)
+                }
+            }
+    }
+}
+```
+
+### Git Hooks Integration
+
+The plugin automatically sets up git hooks for consistent commits:
+
+```kotlin
+open class PreCommitHooksInstallationTask : DefaultTask() {
+    @TaskAction
+    fun setupPreCommitHooks() {
+        // Setup husky
+        val huskyDirectory = File(project.projectDir, ".husky")
+        
+        // Copy configuration files
+        extractResourceToFile("package.json", huskyDirectory)
+        extractResourceToFile("commitlint.config.js", huskyDirectory)
+        extractResourceToFile("pre-commit", huskyDirectory)
+        extractResourceToFile("commit-msg", huskyDirectory)
+        
+        // Make hooks executable
+        project.executeCommand("chmod +x .husky/pre-commit")
+        project.executeCommand("chmod +x .husky/commit-msg")
+    }
+}
+```
+
+The plugin also includes additional features like:
+- Automatic changelog generation
+- Slack notifications for releases
+- PDF changelog generation
+- Support for both release and snapshot versions
+
+This implementation provides a robust solution for managing multi-module library releases while maintaining code quality through enforced conventions.
+
+## Benefits and Impact
+
+1. **Developer Experience**:
+   - Simple plugin application
+   - Enforced commit conventions
+   - Automated version management
+
+2. **Code Quality**:
+   - Consistent commit history
+   - Traceable changes
+   - Automated validation
+
+3. **CI/CD Efficiency**:
+   - Reduced pipeline complexity
+   - Automatic detection of changes
+   - Smart publishing decisions
+
+## Lessons Learned
+
+1. **Convention Over Configuration**: By establishing conventions, we significantly reduced boilerplate code.
+2. **Tool Integration**: Combining Gradle with Node.js tools provided powerful automation capabilities.
+3. **Developer Adoption**: Clear documentation and immediate feedback helped in developer adoption.
+
+## Future Improvements
+
+1. Add support for custom commit scopes
+2. Implement changelog generation
+3. Add release notification integrations
+
+## Conclusion
+
+This custom Gradle plugin has significantly improved our release process by automating version management, enforcing conventions, and simplifying CI/CD configuration. The combination of Gradle and Node.js tools proved to be powerful for creating a comprehensive solution.
+
+Feel free to share your thoughts or ask questions about implementing similar automation in your projects! 

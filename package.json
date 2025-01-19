@@ -12,9 +12,16 @@
   "license": "ISC",
   "description": "",
   "dependencies": {
+    "@mdx-js/loader": "^3.1.0",
+    "@mdx-js/react": "^3.1.0",
+    "@next/mdx": "^15.1.5",
+    "gray-matter": "^4.0.3",
     "next": "latest",
+    "next-mdx-remote": "^5.0.0",
     "react": "latest",
-    "react-dom": "latest"
+    "react-dom": "latest",
+    "rehype-highlight": "^7.0.1",
+    "remark-gfm": "^4.0.0"
   },
   "devDependencies": {
     "@types/node": "latest",
